@@ -13,12 +13,13 @@ config.read('transcode_config.conf')
 if 'Paths' not in config:
     raise ValueError("Configuration file must contain a [Paths] section")
 
-# Read paths and extensions from config
-INPUT_DIR = config['Paths'].get('input_dir', '/mnt/dump/2.Convert')
-OUTPUT_DIR = config['Paths'].get('output_dir', '/mnt/dump/3.Converted')
-LOG_FILE = config['Paths'].get('transcode_log', '/mnt/dump/logs/video_transcode.log')
+# Read paths and extensions from config, defaulting to user's Videos folder
+home_videos = os.path.join(os.path.expanduser("~"), "Videos")
+INPUT_DIR = config['Paths'].get('input_dir', os.path.join(home_videos, "ToConvert"))
+OUTPUT_DIR = config['Paths'].get('output_dir', os.path.join(home_videos, "Converted"))
+LOG_FILE = config['Paths'].get('transcode_log', os.path.join(home_videos, "Logs", "video_transcode.log"))
 VIDEO_EXTENSIONS = tuple(
-    ext.strip() for ext in config['Paths'].get('video_extensions', '.mp4,.mkv,.avi,.mov,.mxf').split(',')
+    ext.strip() for ext in config['Paths'].get('video_extensions', '.mp4,.mkv,.avi,.mov,.mxf,.flv,.wmv').split(',')
 )
 
 # Ensure log directory exists
@@ -49,7 +50,7 @@ def get_video_info(file_path):
     logging.info(f"Analyzing {file_path}...")
     try:
         cmd = [
-            "ffprobe", "-v", "error", "-show_streams",
+            "ffprobe", "-v", "-error", "-show_streams",
             "-select_streams", "v:0", "-print_format", "json", file_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -72,7 +73,6 @@ def get_video_info(file_path):
         
         color_info = {
             "colorprim": video_stream.get("color_primaries", "bt709"),
-            "license": video_stream.get("license", ""),
             "transfer": video_stream.get("color_transfer", "bt709"),
             "colormatrix": video_stream.get("color_space", "bt709")
         }
