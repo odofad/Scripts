@@ -18,6 +18,14 @@ NET_IFACE=$(ip -o -f inet addr show | awk '/scope global/ {print $2}' | head -1)
 # Get script's directory for default config path
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Get user's home directory for wgclients folder
+if [[ -n $SUDO_USER ]]; then
+    USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    USER_HOME=$HOME
+fi
+WG_CLIENTS_DIR="$USER_HOME/wgclients"
+
 # Ensure script runs as root
 if [[ $EUID -ne 0 ]]; then
     echo "WireGuardInstall must be run as root (use sudo)."
@@ -229,6 +237,58 @@ detect_view_config() {
     else
         echo "WireGuardInstall: WireGuard is not installed."
     fi
+
+    # Prompt to delete a client
+    if [[ -f $WG_CONFIG && -n $(grep "^# Client:" $WG_CONFIG) ]]; then
+        echo -e "\nWireGuardInstall: Existing clients:"
+        grep -B1 -A2 "^# Client:" $WG_CONFIG | grep -E "^# Client:|PublicKey|AllowedIPs" | awk '{print $0}' | paste - - - | column -t
+        read -p "Delete a client? (y/n) [default: n]: " delete_choice
+        delete_choice=${delete_choice:-n}
+        if [[ $delete_choice =~ ^[Yy]$ ]]; then
+            read -p "Enter client name or public key to delete: " DELETE_IDENTIFIER
+            if [[ -z $DELETE_IDENTIFIER ]]; then
+                echo "WireGuardInstall: Client name or public key required."
+                return
+            fi
+            # Check if identifier matches a client name or public key
+            if grep -B1 "# Client:.*$DELETE_IDENTIFIER" $WG_CONFIG >/dev/null || grep "PublicKey = $DELETE_IDENTIFIER" $WG_CONFIG >/dev/null; then
+                # Extract client name for config file deletion
+                CLIENT_NAME=$(grep -B1 "PublicKey = $DELETE_IDENTIFIER" $WG_CONFIG | grep "^# Client:" | awk -F ': ' '{print $2}' || echo "")
+                if [[ -z $CLIENT_NAME ]]; then
+                    CLIENT_NAME=$(grep "# Client:.*$DELETE_IDENTIFIER" $WG_CONFIG | awk -F ': ' '{print $2}' || echo "")
+                fi
+                # Remove peer from wg0.conf
+                sed -i "/# Client:.*$DELETE_IDENTIFIER\|PublicKey = $DELETE_IDENTIFIER/,+2d" $WG_CONFIG
+                if ! grep "PublicKey = $DELETE_IDENTIFIER" $WG_CONFIG >/dev/null; then
+                    echo "WireGuardInstall: Successfully deleted client."
+                    # Delete client config file if it exists
+                    if [[ -n $CLIENT_NAME ]]; then
+                        CLIENT_NAME_SAFE=$(echo "$CLIENT_NAME" | tr -dc '[:alnum:]_-' | tr '[:upper:]' '[:lower:]')
+                        CLIENT_CONF="$WG_CLIENTS_DIR/client_$CLIENT_NAME_SAFE.conf"
+                        if [[ -f $CLIENT_CONF ]]; then
+                            read -p "Also delete client config file $CLIENT_CONF? (y/n) [default: y]: " delete_file
+                            delete_file=${delete_file:-y}
+                            if [[ $delete_file =~ ^[Yy]$ ]]; then
+                                rm -f "$CLIENT_CONF"
+                                echo "WireGuardInstall: Deleted $CLIENT_CONF."
+                            fi
+                        fi
+                    fi
+                    # Restart WireGuard
+                    systemctl restart wg-quick@$WG_INTERFACE
+                    if [[ $? -eq 0 ]]; then
+                        echo "WireGuardInstall: WireGuard restarted successfully."
+                    else
+                        echo "WireGuardInstall: Error: Failed to restart WireGuard."
+                    fi
+                else
+                    echo "WireGuardInstall: Error: Failed to delete client from $WG_CONFIG."
+                fi
+            else
+                echo "WireGuardInstall: No client found with name or public key '$DELETE_IDENTIFIER'."
+            fi
+        fi
+    fi
 }
 
 # Submenu Option 2.2: Setup Client Keys and Connections
@@ -248,7 +308,9 @@ setup_client_connections() {
 
     # Sanitize client name for filename
     CLIENT_NAME_SAFE=$(echo "$CLIENT_NAME" | tr -dc '[:alnum:]_-' | tr '[:upper:]' '[:lower:]')
-    CLIENT_CONF="/etc/wireguard/client_$CLIENT_NAME_SAFE.conf"
+    # Use wgclients directory in user's home
+    mkdir -p "$WG_CLIENTS_DIR"
+    CLIENT_CONF="$WG_CLIENTS_DIR/client_$CLIENT_NAME_SAFE.conf"
 
     # Get next available IP
     CLIENT_IP=$(get_next_ip $VPN_SUBNET)
@@ -261,8 +323,8 @@ setup_client_connections() {
     read -p "Enter client public key (or press Enter to generate new keys): " CLIENT_PUBKEY
     if [[ -z $CLIENT_PUBKEY ]]; then
         # Generate new keys for client
-        CLIENT_PRIVKEY_FILE="/etc/wireguard/client_$CLIENT_NAME_SAFE_privatekey"
-        CLIENT_PUBKEY_FILE="/etc/wireguard/client_$CLIENT_NAME_SAFE_publickey"
+        CLIENT_PRIVKEY_FILE="$WG_CLIENTS_DIR/client_$CLIENT_NAME_SAFE_privatekey"
+        CLIENT_PUBKEY_FILE="$WG_CLIENTS_DIR/client_$CLIENT_NAME_SAFE_publickey"
         generate_keys "$CLIENT_PRIVKEY_FILE" "$CLIENT_PUBKEY_FILE"
         CLIENT_PRIVKEY=$(cat "$CLIENT_PRIVKEY_FILE")
         CLIENT_PUBKEY=$(cat "$CLIENT_PUBKEY_FILE")
