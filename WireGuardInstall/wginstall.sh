@@ -29,14 +29,16 @@ install_wireguard() {
 
 # Function to generate key pairs
 generate_keys() {
+    local privkey_file=$1
+    local pubkey_file=$2
     echo "WireGuardInstall: Generating new key pair..."
     privkey=$(wg genkey)
     pubkey=$(echo "$privkey" | wg pubkey)
-    mkdir -p $WG_KEY_DIR
-    echo "$privkey" > $WG_PRIVATE_KEY
-    echo "$pubkey" > $WG_PUBLIC_KEY
-    chmod 600 $WG_PRIVATE_KEY $WG_PUBLIC_KEY
-    echo "WireGuardInstall: Private key saved to $WG_PRIVATE_KEY"
+    mkdir -p $(dirname "$privkey_file")
+    echo "$privkey" > "$privkey_file"
+    echo "$pubkey" > "$pubkey_file"
+    chmod 600 "$privkey_file" "$pubkey_file"
+    echo "WireGuardInstall: Private key saved to $privkey_file"
     echo "WireGuardInstall: Public key: $pubkey"
 }
 
@@ -49,13 +51,64 @@ check_keys() {
         read -p "Reuse existing keys? (y/n) [default: y]: " reuse
         reuse=${reuse:-y}
         if [[ $reuse =~ ^[Nn]$ ]]; then
-            generate_keys
+            generate_keys "$WG_PRIVATE_KEY" "$WG_PUBLIC_KEY"
             return 1
         fi
         return 0
     else
-        generate_keys
+        generate_keys "$WG_PRIVATE_KEY" "$WG_PUBLIC_KEY"
         return 1
+    fi
+}
+
+# Function to find next available IP
+get_next_ip() {
+    local subnet=$1
+    local used_ips=()
+    if [[ -f $WG_CONFIG ]]; then
+        # Extract IPs from AllowedIPs (e.g., 10.0.0.2/32)
+        while IFS= read -r ip; do
+            ip=$(echo "$ip" | grep -o "$subnet\.[0-9]\+")
+            used_ips+=("$ip")
+        done < <(grep "AllowedIPs" $WG_CONFIG)
+    fi
+    # Start from 10.0.0.2 (reserve .1 for server)
+    for ((i=2; i<=254; i++)); do
+        local candidate="$subnet.$i"
+        if [[ ! " ${used_ips[*]} " =~ " $candidate " ]]; then
+            echo "$candidate"
+            return
+        fi
+    done
+    echo "WireGuardInstall: No available IPs in $subnet.0/24." >&2
+    exit 1
+}
+
+# Function to parse client config file
+parse_client_config() {
+    local config_file=$1
+    if [[ ! -f $config_file ]]; then
+        echo "WireGuardInstall: Config file $config_file not found."
+        exit 1
+    fi
+
+    # Extract values using grep and awk
+    CLIENT_PRIVKEY=$(grep "PrivateKey" "$config_file" | awk -F '= ' '{print $2}' | tr -d '[:space:]')
+    CLIENT_IP=$(grep "Address" "$config_file" | awk -F '= ' '{print $2}' | awk -F '/' '{print $1}' | tr -d '[:space:]')
+    VPS_PUBKEY=$(grep "PublicKey" "$config_file" | awk -F '= ' '{print $2}' | tr -d '[:space:]')
+    ENDPOINT=$(grep "Endpoint" "$config_file" | awk -F '= ' '{print $2}' | tr -d '[:space:]')
+
+    # Validate extracted values
+    if [[ -z $CLIENT_PRIVKEY || -z $CLIENT_IP || -z $VPS_PUBKEY || -z $ENDPOINT ]]; then
+        echo "WireGuardInstall: Invalid or incomplete config file. Missing required fields."
+        exit 1
+    fi
+
+    # Extract VPS_IP and port from endpoint
+    VPS_IP=$(echo "$ENDPOINT" | awk -F ':' '{print $1}')
+    PORT=$(echo "$ENDPOINT" | awk -F ':' '{print $2}')
+    if [[ "$PORT" != "$WG_PORT" ]]; then
+        echo "WireGuardInstall: Warning: Endpoint port ($PORT) differs from default ($WG_PORT). Using $PORT."
     fi
 }
 
@@ -67,11 +120,6 @@ setup_client() {
     else
         echo "WireGuardInstall: WireGuard already installed."
     fi
-
-    # Check for existing keys
-    check_keys "client"
-    CLIENT_PRIVKEY=$(cat $WG_PRIVATE_KEY)
-    CLIENT_PUBKEY=$(cat $WG_PUBLIC_KEY)
 
     # Check for existing config
     if [[ -f $WG_CONFIG ]]; then
@@ -86,14 +134,46 @@ setup_client() {
         fi
     fi
 
-    # Get VPS public key and IP
-    read -p "Enter VPS public key: " VPS_PUBKEY
-    read -p "Enter VPS public IP [default: $VPS_IP]: " INPUT_VPS_IP
-    VPS_IP=${INPUT_VPS_IP:-$VPS_IP}
+    # Prompt for import or manual setup
+    read -p "Import client config file? (y/n) [default: n]: " import_choice
+    import_choice=${import_choice:-n}
 
-    # Create client config
-    CLIENT_IP="$VPN_SUBNET.2"
-    cat > $WG_CONFIG << EOL
+    if [[ $import_choice =~ ^[Yy]$ ]]; then
+        read -p "Enter path to client config file (e.g., client_gamingserver1.conf): " CONFIG_FILE
+        parse_client_config "$CONFIG_FILE"
+
+        # Generate public key from private key for verification
+        mkdir -p $WG_KEY_DIR
+        echo "$CLIENT_PRIVKEY" > $WG_PRIVATE_KEY
+        chmod 600 $WG_PRIVATE_KEY
+        CLIENT_PUBKEY=$(cat $WG_PRIVATE_KEY | wg pubkey)
+        echo "$CLIENT_PUBKEY" > $WG_PUBLIC_KEY
+        chmod 600 $WG_PUBLIC_KEY
+
+        # Create client config
+        cat > $WG_CONFIG << EOL
+[Interface]
+PrivateKey = $CLIENT_PRIVKEY
+Address = $CLIENT_IP/24
+
+[Peer]
+PublicKey = $VPS_PUBKEY
+Endpoint = $ENDPOINT
+AllowedIPs = $VPN_SUBNET.0/24
+PersistentKeepalive = 25
+EOL
+    else
+        # Manual setup
+        check_keys "client"
+        CLIENT_PRIVKEY=$(cat $WG_PRIVATE_KEY)
+        CLIENT_PUBKEY=$(cat $WG_PUBLIC_KEY)
+
+        read -p "Enter VPS public key: " VPS_PUBKEY
+        read -p "Enter VPS public IP [default: $VPS_IP]: " INPUT_VPS_IP
+        VPS_IP=${INPUT_VPS_IP:-$VPS_IP}
+        CLIENT_IP="$VPN_SUBNET.2"
+
+        cat > $WG_CONFIG << EOL
 [Interface]
 PrivateKey = $CLIENT_PRIVKEY
 Address = $CLIENT_IP/24
@@ -104,6 +184,7 @@ Endpoint = $VPS_IP:$WG_PORT
 AllowedIPs = $VPN_SUBNET.0/24
 PersistentKeepalive = 25
 EOL
+    fi
 
     # Start WireGuard
     systemctl enable wg-quick@$WG_INTERFACE
@@ -148,30 +229,78 @@ setup_client_connections() {
         return
     fi
 
-    read -p "Enter client public key: " CLIENT_PUBKEY
-    read -p "Enter client VPN IP (e.g., $VPN_SUBNET.2): " CLIENT_IP
-    if [[ -z $CLIENT_PUBKEY || -z $CLIENT_IP ]]; then
-        echo "WireGuardInstall: Client public key and IP are required."
+    # Prompt for client name
+    read -p "Enter client name (e.g., GamingServer1): " CLIENT_NAME
+    if [[ -z $CLIENT_NAME ]]; then
+        echo "WireGuardInstall: Client name is required."
         return
     fi
 
+    # Sanitize client name for filename
+    CLIENT_NAME_SAFE=$(echo "$CLIENT_NAME" | tr -dc '[:alnum:]_-' | tr '[:upper:]' '[:lower:]')
+    CLIENT_CONF="/etc/wireguard/client_$CLIENT_NAME_SAFE.conf"
+
+    # Get next available IP
+    CLIENT_IP=$(get_next_ip $VPN_SUBNET)
+    if [[ -z $CLIENT_IP ]]; then
+        echo "WireGuardInstall: Failed to assign client IP."
+        return
+    fi
+
+    # Prompt for client public key
+    read -p "Enter client public key (or press Enter to generate new keys): " CLIENT_PUBKEY
+    if [[ -z $CLIENT_PUBKEY ]]; then
+        # Generate new keys for client
+        CLIENT_PRIVKEY_FILE="/etc/wireguard/client_$CLIENT_NAME_SAFE_privatekey"
+        CLIENT_PUBKEY_FILE="/etc/wireguard/client_$CLIENT_NAME_SAFE_publickey"
+        generate_keys "$CLIENT_PRIVKEY_FILE" "$CLIENT_PUBKEY_FILE"
+        CLIENT_PRIVKEY=$(cat "$CLIENT_PRIVKEY_FILE")
+        CLIENT_PUBKEY=$(cat "$CLIENT_PUBKEY_FILE")
+    else
+        # Use provided public key, no private key needed here
+        CLIENT_PRIVKEY="YOUR_PRIVATE_KEY_HERE"
+    fi
+
     # Check if client already exists
-    if grep -q "$CLIENT_PUBKEY" $WG_CONFIG; then
+    if [[ -n $(grep "$CLIENT_PUBKEY" $WG_CONFIG) ]]; then
         echo "WireGuardInstall: Client with public key $CLIENT_PUBKEY already exists."
         read -p "Overwrite this client? (y/n) [default: n]: " overwrite
         overwrite=${overwrite:-n}
         if [[ $overwrite =~ ^[Yy]$ ]]; then
             # Remove existing peer
-            sed -i "/PublicKey = $CLIENT_PUBKEY/,/AllowedIPs/ { /PublicKey/!d; /AllowedIPs/!d; s/AllowedIPs.*/AllowedIPs = $CLIENT_IP\/32/ }" $WG_CONFIG
-            echo "WireGuardInstall: Updated client with IP $CLIENT_IP."
+            sed -i "/# Client: .*\|PublicKey = $CLIENT_PUBKEY/,/AllowedIPs/ { /PublicKey/!d; /AllowedIPs/!d; s/AllowedIPs.*/AllowedIPs = $CLIENT_IP\/32/ }" $WG_CONFIG
+            echo "# Client: $CLIENT_NAME" >> $WG_CONFIG
+            echo "WireGuardInstall: Updated client '$CLIENT_NAME' with IP $CLIENT_IP."
         else
             echo "WireGuardInstall: Keeping existing client."
             return
         fi
     else
         # Add new peer
-        echo -e "\n[Peer]\nPublicKey = $CLIENT_PUBKEY\nAllowedIPs = $CLIENT_IP/32" >> $WG_CONFIG
-        echo "WireGuardInstall: Added client with IP $CLIENT_IP."
+        echo -e "\n# Client: $CLIENT_NAME\n[Peer]\nPublicKey = $CLIENT_PUBKEY\nAllowedIPs = $CLIENT_IP/32" >> $WG_CONFIG
+        echo "WireGuardInstall: Added client '$CLIENT_NAME' with IP $CLIENT_IP."
+    fi
+
+    # Generate client config file
+    if [[ "$CLIENT_PRIVKEY" != "YOUR_PRIVATE_KEY_HERE" ]]; then
+        SERVER_PUBKEY=$(cat $WG_PUBLIC_KEY)
+        cat > "$CLIENT_CONF" << EOL
+[Interface]
+PrivateKey = $CLIENT_PRIVKEY
+Address = $CLIENT_IP/24
+
+[Peer]
+PublicKey = $SERVER_PUBKEY
+Endpoint = $VPS_IP:$WG_PORT
+AllowedIPs = $VPN_SUBNET.0/24
+PersistentKeepalive = 25
+EOL
+        chmod 600 "$CLIENT_CONF"
+        echo "WireGuardInstall: Generated client config at $CLIENT_CONF"
+        echo "WireGuardInstall: Transfer this file to the client and use with 'wg-quick up <file>' or import in Option 1."
+    else
+        echo "WireGuardInstall: Using provided public key. No client config generated (private key unknown)."
+        echo "WireGuardInstall: Create client config manually with IP $CLIENT_IP and server details."
     fi
 
     # Restart WireGuard
@@ -259,7 +388,7 @@ list_clients() {
     echo "WireGuardInstall: Listing configured clients..."
     if [[ -f $WG_CONFIG ]]; then
         echo "Clients in $WG_CONFIG:"
-        grep -A3 "\[Peer\]" $WG_CONFIG | grep -E "PublicKey|AllowedIPs" | awk '{print $3}' | paste - - | column -t
+        grep -B1 -A2 "^# Client:\|^[Peer\]" $WG_CONFIG | grep -E "^# Client:|PublicKey|AllowedIPs" | awk '{print $0}' | paste - - - | column -t
     else
         echo "WireGuardInstall: No WireGuard config found at $WG_CONFIG."
     fi
@@ -271,7 +400,14 @@ port_forwards_firewall() {
     read -p "Enter game port (e.g., 25565 for Minecraft): " GAME_PORT
     read -p "Enter protocol (tcp/udp) [default: tcp]: " PROTOCOL
     PROTOCOL=${PROTOCOL:-tcp}
-    CLIENT_IP="$VPN_SUBNET.2"
+
+    # List available client IPs
+    if [[ -f $WG_CONFIG ]]; then
+        echo "Available client IPs:"
+        grep "AllowedIPs" $WG_CONFIG | awk '{print $3}' | sort
+    fi
+    read -p "Enter client IP for forwarding (e.g., $VPN_SUBNET.2): " CLIENT_IP
+    CLIENT_IP=${CLIENT_IP:-$VPN_SUBNET.2}
 
     # Set up iptables for port forwarding
     echo "WireGuardInstall: Setting up iptables rules..."
