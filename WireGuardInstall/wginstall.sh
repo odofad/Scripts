@@ -6,6 +6,9 @@
 
 # Configuration variables
 WG_CONFIG="/etc/wireguard/wg0.conf"
+WG_KEY_DIR="/etc/wireguard"
+WG_PRIVATE_KEY="$WG_KEY_DIR/privatekey"
+WG_PUBLIC_KEY="$WG_KEY_DIR/publickey"
 WG_INTERFACE="wg0"
 WG_PORT="51820"
 VPN_SUBNET="10.0.0"
@@ -26,12 +29,34 @@ install_wireguard() {
 
 # Function to generate key pairs
 generate_keys() {
+    echo "WireGuardInstall: Generating new key pair..."
     privkey=$(wg genkey)
     pubkey=$(echo "$privkey" | wg pubkey)
-    echo "$privkey" > privatekey
-    echo "$pubkey" > publickey
-    echo "Private key: $privkey"
-    echo "Public key: $pubkey"
+    mkdir -p $WG_KEY_DIR
+    echo "$privkey" > $WG_PRIVATE_KEY
+    echo "$pubkey" > $WG_PUBLIC_KEY
+    chmod 600 $WG_PRIVATE_KEY $WG_PUBLIC_KEY
+    echo "WireGuardInstall: Private key saved to $WG_PRIVATE_KEY"
+    echo "WireGuardInstall: Public key: $pubkey"
+}
+
+# Function to check and manage keys
+check_keys() {
+    local role=$1 # "client" or "server"
+    if [[ -f $WG_PRIVATE_KEY && -f $WG_PUBLIC_KEY ]]; then
+        echo "WireGuardInstall: Existing keys found for $role."
+        echo "Public key: $(cat $WG_PUBLIC_KEY)"
+        read -p "Reuse existing keys? (y/n) [default: y]: " reuse
+        reuse=${reuse:-y}
+        if [[ $reuse =~ ^[Nn]$ ]]; then
+            generate_keys
+            return 1
+        fi
+        return 0
+    else
+        generate_keys
+        return 1
+    fi
 }
 
 # Menu Option 1: Setup Client (Gaming Server)
@@ -39,14 +64,27 @@ setup_client() {
     echo "WireGuardInstall: Setting up WireGuard client (gaming server)..."
     if ! command -v wg >/dev/null; then
         install_wireguard
+    else
+        echo "WireGuardInstall: WireGuard already installed."
     fi
 
-    # Generate keys
-    echo "WireGuardInstall: Generating client keys..."
-    generate_keys
-    CLIENT_PRIVKEY=$(cat privatekey)
-    CLIENT_PUBKEY=$(cat publickey)
-    rm privatekey publickey
+    # Check for existing keys
+    check_keys "client"
+    CLIENT_PRIVKEY=$(cat $WG_PRIVATE_KEY)
+    CLIENT_PUBKEY=$(cat $WG_PUBLIC_KEY)
+
+    # Check for existing config
+    if [[ -f $WG_CONFIG ]]; then
+        echo "WireGuardInstall: Existing config found at $WG_CONFIG."
+        read -p "Overwrite config? (y/n) [default: n]: " overwrite
+        overwrite=${overwrite:-n}
+        if [[ $overwrite =~ ^[Yy]$ ]]; then
+            rm -f $WG_CONFIG
+        else
+            echo "WireGuardInstall: Keeping existing config. Please manually edit $WG_CONFIG if needed."
+            return
+        fi
+    fi
 
     # Get VPS public key and IP
     read -p "Enter VPS public key: " VPS_PUBKEY
@@ -69,31 +107,113 @@ EOL
 
     # Start WireGuard
     systemctl enable wg-quick@$WG_INTERFACE
-    systemctl start wg-quick@$WG_INTERFACE
+    systemctl restart wg-quick@$WG_INTERFACE
     echo "WireGuardInstall: Client setup complete. Client IP: $CLIENT_IP"
     echo "WireGuardInstall: Config saved to $WG_CONFIG"
+    echo "WireGuardInstall: Public key: $CLIENT_PUBKEY"
 }
 
-# Menu Option 2: Setup Server (VPS)
-setup_server() {
-    echo "WireGuardInstall: Setting up WireGuard server (VPS)..."
+# Submenu Option 2.1: Detect and View Configuration and Keys
+detect_view_config() {
+    echo "WireGuardInstall: Detecting and viewing configuration and keys..."
+    if [[ -f $WG_PRIVATE_KEY && -f $WG_PUBLIC_KEY ]]; then
+        echo "WireGuardInstall: Keys found."
+        echo "Public key: $(cat $WG_PUBLIC_KEY)"
+        echo "Private key location: $WG_PRIVATE_KEY (contents not displayed for security)"
+    else
+        echo "WireGuardInstall: No keys found in $WG_KEY_DIR."
+    fi
+
+    if [[ -f $WG_CONFIG ]]; then
+        echo "WireGuardInstall: Configuration found at $WG_CONFIG:"
+        cat $WG_CONFIG
+    else
+        echo "WireGuardInstall: No configuration found at $WG_CONFIG."
+    fi
+
+    if command -v wg >/dev/null; then
+        echo "WireGuardInstall: WireGuard is installed."
+        echo "WireGuardInstall: Current status:"
+        wg show
+    else
+        echo "WireGuardInstall: WireGuard is not installed."
+    fi
+}
+
+# Submenu Option 2.2: Setup Client Keys and Connections
+setup_client_connections() {
+    echo "WireGuardInstall: Setting up client keys and connections..."
+    if [[ ! -f $WG_CONFIG ]]; then
+        echo "WireGuardInstall: No server config found at $WG_CONFIG. Please run 'Install Server' first."
+        return
+    fi
+
+    read -p "Enter client public key: " CLIENT_PUBKEY
+    read -p "Enter client VPN IP (e.g., $VPN_SUBNET.2): " CLIENT_IP
+    if [[ -z $CLIENT_PUBKEY || -z $CLIENT_IP ]]; then
+        echo "WireGuardInstall: Client public key and IP are required."
+        return
+    fi
+
+    # Check if client already exists
+    if grep -q "$CLIENT_PUBKEY" $WG_CONFIG; then
+        echo "WireGuardInstall: Client with public key $CLIENT_PUBKEY already exists."
+        read -p "Overwrite this client? (y/n) [default: n]: " overwrite
+        overwrite=${overwrite:-n}
+        if [[ $overwrite =~ ^[Yy]$ ]]; then
+            # Remove existing peer
+            sed -i "/PublicKey = $CLIENT_PUBKEY/,/AllowedIPs/ { /PublicKey/!d; /AllowedIPs/!d; s/AllowedIPs.*/AllowedIPs = $CLIENT_IP\/32/ }" $WG_CONFIG
+            echo "WireGuardInstall: Updated client with IP $CLIENT_IP."
+        else
+            echo "WireGuardInstall: Keeping existing client."
+            return
+        fi
+    else
+        # Add new peer
+        echo -e "\n[Peer]\nPublicKey = $CLIENT_PUBKEY\nAllowedIPs = $CLIENT_IP/32" >> $WG_CONFIG
+        echo "WireGuardInstall: Added client with IP $CLIENT_IP."
+    fi
+
+    # Restart WireGuard
+    systemctl restart wg-quick@$WG_INTERFACE
+    echo "WireGuardInstall: WireGuard restarted. Client connection updated."
+}
+
+# Submenu Option 2.3: Install Server
+install_server() {
+    echo "WireGuardInstall: Installing WireGuard server (VPS)..."
     if ! command -v wg >/dev/null; then
         install_wireguard
+    else
+        echo "WireGuardInstall: WireGuard already installed."
     fi
 
     # Enable IP forwarding
-    echo "WireGuardInstall: Enabling IP forwarding..."
-    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
-    sysctl -p
+    if ! grep -q "net.ipv4.ip_forward = 1" /etc/sysctl.conf; then
+        echo "WireGuardInstall: Enabling IP forwarding..."
+        echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+        sysctl -p
+    else
+        echo "WireGuardInstall: IP forwarding already enabled."
+    fi
 
-    # Generate server keys
-    echo "WireGuardInstall: Generating server keys..."
-    mkdir -p /etc/wireguard
-    generate_keys
-    SERVER_PRIVKEY=$(cat privatekey)
-    SERVER_PUBKEY=$(cat publickey)
-    mv privatekey /etc/wireguard/
-    mv publickey /etc/wireguard/
+    # Check for existing keys
+    check_keys "server"
+    SERVER_PRIVKEY=$(cat $WG_PRIVATE_KEY)
+    SERVER_PUBKEY=$(cat $WG_PUBLIC_KEY)
+
+    # Check for existing config
+    if [[ -f $WG_CONFIG ]]; then
+        echo "WireGuardInstall: Existing config found at $WG_CONFIG."
+        read -p "Overwrite config? (y/n) [default: n]: " overwrite
+        overwrite=${overwrite:-n}
+        if [[ $overwrite =~ ^[Yy]$ ]]; then
+            rm -f $WG_CONFIG
+        else
+            echo "WireGuardInstall: Keeping existing config. Please manually edit $WG_CONFIG if needed."
+            return
+        fi
+    fi
 
     # Create server config
     SERVER_IP="$VPN_SUBNET.1"
@@ -108,10 +228,30 @@ EOL
 
     # Start WireGuard
     systemctl enable wg-quick@$WG_INTERFACE
-    systemctl start wg-quick@$WG_INTERFACE
+    systemctl restart wg-quick@$WG_INTERFACE
     echo "WireGuardInstall: Server setup complete. Server IP: $SERVER_IP"
     echo "WireGuardInstall: Public key: $SERVER_PUBKEY"
     echo "WireGuardInstall: Config saved to $WG_CONFIG"
+}
+
+# Menu Option 2: Server Submenu
+server_menu() {
+    while true; do
+        echo -e "\n=== WireGuardInstall Server Setup Submenu ==="
+        echo "1. Detect and View Configuration and Keys"
+        echo "2. Setup Client Keys and Connections"
+        echo "3. Install Server"
+        echo "4. Back to Main Menu"
+        read -p "Select an option [1-4]: " sub_choice
+
+        case $sub_choice in
+            1) detect_view_config ;;
+            2) setup_client_connections ;;
+            3) install_server ;;
+            4) break ;;
+            *) echo "WireGuardInstall: Invalid option. Please try again." ;;
+        esac
+    done
 }
 
 # Menu Option 3: List Clients
@@ -160,7 +300,7 @@ while true; do
 
     case $choice in
         1) setup_client ;;
-        2) setup_server ;;
+        2) server_menu ;;
         3) list_clients ;;
         4) port_forwards_firewall ;;
         5) echo "WireGuardInstall: Exiting..."; exit 0 ;;
