@@ -11,9 +11,12 @@ WG_PRIVATE_KEY="$WG_KEY_DIR/privatekey"
 WG_PUBLIC_KEY="$WG_KEY_DIR/publickey"
 WG_INTERFACE="wg0"
 WG_PORT="51820"
-VPN_SUBNET="10.8.0" # Updated to match your config
+VPN_SUBNET="10.8.0" # Matches your config
 VPS_IP=$(curl -s ifconfig.me) # Auto-detect public IP
 NET_IFACE=$(ip -o -f inet addr show | awk '/scope global/ {print $2}' | head -1) # Auto-detect network interface
+
+# Get script's directory for default config path
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Ensure script runs as root
 if [[ $EUID -ne 0 ]]; then
@@ -139,7 +142,14 @@ setup_client() {
     import_choice=${import_choice:-n}
 
     if [[ $import_choice =~ ^[Yy]$ ]]; then
-        read -p "Enter path to client config file (e.g., client_gamingserver1.conf): " CONFIG_FILE
+        read -p "Enter client config filename (default: client_gamingserver1.conf in $SCRIPT_DIR): " CONFIG_FILENAME
+        CONFIG_FILENAME=${CONFIG_FILENAME:-client_gamingserver1.conf}
+        # If no absolute path, assume script directory
+        if [[ ! $CONFIG_FILENAME =~ ^/ ]]; then
+            CONFIG_FILE="$SCRIPT_DIR/$CONFIG_FILENAME"
+        else
+            CONFIG_FILE="$CONFIG_FILENAME"
+        fi
         parse_client_config "$CONFIG_FILE"
 
         # Generate public key from private key for verification
