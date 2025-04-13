@@ -11,7 +11,7 @@ WG_PRIVATE_KEY="$WG_KEY_DIR/privatekey"
 WG_PUBLIC_KEY="$WG_KEY_DIR/publickey"
 WG_INTERFACE="wg0"
 WG_PORT="51820"
-VPN_SUBNET="10.0.0"
+VPN_SUBNET="10.8.0" # Updated to match your config
 VPS_IP=$(curl -s ifconfig.me) # Auto-detect public IP
 NET_IFACE=$(ip -o -f inet addr show | awk '/scope global/ {print $2}' | head -1) # Auto-detect network interface
 
@@ -66,13 +66,13 @@ get_next_ip() {
     local subnet=$1
     local used_ips=()
     if [[ -f $WG_CONFIG ]]; then
-        # Extract IPs from AllowedIPs (e.g., 10.0.0.2/32)
+        # Extract IPs from AllowedIPs (e.g., 10.8.0.2/32)
         while IFS= read -r ip; do
             ip=$(echo "$ip" | grep -o "$subnet\.[0-9]\+")
-            used_ips+=("$ip")
+            [[ -n $ip ]] && used_ips+=("$ip")
         done < <(grep "AllowedIPs" $WG_CONFIG)
     fi
-    # Start from 10.0.0.2 (reserve .1 for server)
+    # Start from 10.8.0.2 (reserve .1 for server)
     for ((i=2; i<=254; i++)); do
         local candidate="$subnet.$i"
         if [[ ! " ${used_ips[*]} " =~ " $candidate " ]]; then
@@ -261,24 +261,40 @@ setup_client_connections() {
         CLIENT_PRIVKEY="YOUR_PRIVATE_KEY_HERE"
     fi
 
-    # Check if client already exists
-    if [[ -n $(grep "$CLIENT_PUBKEY" $WG_CONFIG) ]]; then
+    # Check if client already exists by public key or IP
+    if grep -q "PublicKey = $CLIENT_PUBKEY" $WG_CONFIG; then
         echo "WireGuardInstall: Client with public key $CLIENT_PUBKEY already exists."
         read -p "Overwrite this client? (y/n) [default: n]: " overwrite
         overwrite=${overwrite:-n}
         if [[ $overwrite =~ ^[Yy]$ ]]; then
             # Remove existing peer
-            sed -i "/# Client: .*\|PublicKey = $CLIENT_PUBKEY/,/AllowedIPs/ { /PublicKey/!d; /AllowedIPs/!d; s/AllowedIPs.*/AllowedIPs = $CLIENT_IP\/32/ }" $WG_CONFIG
-            echo "# Client: $CLIENT_NAME" >> $WG_CONFIG
-            echo "WireGuardInstall: Updated client '$CLIENT_NAME' with IP $CLIENT_IP."
+            sed -i "/# Client: .*\|PublicKey = $CLIENT_PUBKEY/,+2d" $WG_CONFIG
+            echo "WireGuardInstall: Removed existing client with public key $CLIENT_PUBKEY."
         else
             echo "WireGuardInstall: Keeping existing client."
             return
         fi
+    fi
+    if grep -q "AllowedIPs = $CLIENT_IP/32" $WG_CONFIG; then
+        echo "WireGuardInstall: IP $CLIENT_IP already assigned to another client."
+        read -p "Assign a different IP? (y/n) [default: y]: " reassign
+        reassign=${reassign:-y}
+        if [[ $reassign =~ ^[Yy]$ ]]; then
+            CLIENT_IP=$(get_next_ip $VPN_SUBNET)
+            echo "WireGuardInstall: Assigned new IP: $CLIENT_IP"
+        else
+            echo "WireGuardInstall: Cannot proceed with duplicate IP."
+            return
+        fi
+    fi
+
+    # Add new peer
+    echo -e "\n# Client: $CLIENT_NAME\n[Peer]\nPublicKey = $CLIENT_PUBKEY\nAllowedIPs = $CLIENT_IP/32" >> $WG_CONFIG
+    if grep -q "PublicKey = $CLIENT_PUBKEY" $WG_CONFIG; then
+        echo "WireGuardInstall: Successfully added client '$CLIENT_NAME' with IP $CLIENT_IP."
     else
-        # Add new peer
-        echo -e "\n# Client: $CLIENT_NAME\n[Peer]\nPublicKey = $CLIENT_PUBKEY\nAllowedIPs = $CLIENT_IP/32" >> $WG_CONFIG
-        echo "WireGuardInstall: Added client '$CLIENT_NAME' with IP $CLIENT_IP."
+        echo "WireGuardInstall: Error: Failed to add client to $WG_CONFIG."
+        return
     fi
 
     # Generate client config file
@@ -297,7 +313,7 @@ PersistentKeepalive = 25
 EOL
         chmod 600 "$CLIENT_CONF"
         echo "WireGuardInstall: Generated client config at $CLIENT_CONF"
-        echo "WireGuardInstall: Transfer this file to the client and use with 'wg-quick up <file>' or import in Option 1."
+        echo "WireGuardInstall: Transfer this file to the client and import in Option 1."
     else
         echo "WireGuardInstall: Using provided public key. No client config generated (private key unknown)."
         echo "WireGuardInstall: Create client config manually with IP $CLIENT_IP and server details."
@@ -305,7 +321,12 @@ EOL
 
     # Restart WireGuard
     systemctl restart wg-quick@$WG_INTERFACE
-    echo "WireGuardInstall: WireGuard restarted. Client connection updated."
+    if [[ $? -eq 0 ]]; then
+        echo "WireGuardInstall: WireGuard restarted successfully."
+    else
+        echo "WireGuardInstall: Error: Failed to restart WireGuard."
+        return
+    fi
 }
 
 # Submenu Option 2.3: Install Server
