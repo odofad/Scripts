@@ -133,6 +133,17 @@ parse_client_config() {
     fi
 }
 
+# Function to validate wg0.conf syntax
+validate_wg_config() {
+    local config_file=$1
+    if ! wg-quick strip "$config_file" >/dev/null 2>&1; then
+        log "Error: Invalid configuration in $config_file."
+        log "Please check $config_file for syntax errors."
+        return 1
+    fi
+    return 0
+}
+
 # Menu Option 1: Setup Client (Gaming Server)
 setup_client() {
     log "Setting up WireGuard client (gaming server)..."
@@ -285,6 +296,12 @@ PostUp = iptables -A FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -t nat -A POST
 PostDown = iptables -D FORWARD -i $WG_INTERFACE -j ACCEPT; iptables -t nat -D POSTROUTING -o $NET_IFACE -j MASQUERADE
 EOL
 
+    # Validate config before applying
+    if ! validate_wg_config $WG_CONFIG; then
+        log "Aborting server setup due to invalid configuration."
+        return
+    fi
+
     # Start WireGuard
     systemctl enable wg-quick@$WG_INTERFACE
     systemctl restart wg-quick@$WG_INTERFACE
@@ -390,14 +407,22 @@ add_client() {
         fi
     fi
 
-    # Add new peer
-    echo -e "\n# Client: $CLIENT_NAME\n[Peer]\nPublicKey = $CLIENT_PUBKEY\nAllowedIPs = $CLIENT_IP/32" >> $WG_CONFIG
-    if grep -q "PublicKey = $CLIENT_PUBKEY" $WG_CONFIG; then
-        log "Successfully added client '$CLIENT_NAME' with IP $CLIENT_IP."
-    else
-        log "Error: Failed to add client to $WG_CONFIG."
+    # Create temporary file for new config
+    TEMP_CONFIG=$(mktemp)
+    cat $WG_CONFIG > $TEMP_CONFIG
+    echo -e "\n# Client: $CLIENT_NAME\n[Peer]\nPublicKey = $CLIENT_PUBKEY\nAllowedIPs = $CLIENT_IP/32" >> $TEMP_CONFIG
+
+    # Validate temporary config
+    if ! validate_wg_config $TEMP_CONFIG; then
+        log "Aborting client addition due to invalid configuration."
+        rm -f $TEMP_CONFIG
         return
     fi
+
+    # Apply new config
+    mv $TEMP_CONFIG $WG_CONFIG
+    chmod 600 $WG_CONFIG
+    log "Successfully added client '$CLIENT_NAME' with IP $CLIENT_IP."
 
     # Generate client config file
     if [[ "$CLIENT_PRIVKEY" != "YOUR_PRIVATE_KEY_HERE" ]]; then
@@ -420,13 +445,6 @@ EOL
     else
         log "Using provided public key. No client config generated (private key unknown)."
         log "Create client config manually with IP $CLIENT_IP and server details."
-    fi
-
-    # Validate wg0.conf syntax
-    if ! wg-quick strip wg0 >/dev/null 2>&1; then
-        log "Error: Invalid configuration in $WG_CONFIG."
-        log "Please check $WG_CONFIG for syntax errors."
-        return
     fi
 
     # Restart WireGuard
@@ -476,13 +494,26 @@ delete_client() {
     fi
     # Check if identifier matches a client name or public key
     if grep -B1 "# Client:.*$DELETE_IDENTIFIER" $WG_CONFIG >/dev/null || grep "PublicKey = $DELETE_IDENTIFIER" $WG_CONFIG >/dev/null; then
+        # Create temporary file for new config
+        TEMP_CONFIG=$(mktemp)
+        sed "/# Client:.*$DELETE_IDENTIFIER\|PublicKey = $DELETE_IDENTIFIER/,+2d" $WG_CONFIG > $TEMP_CONFIG
+
+        # Validate temporary config
+        if ! validate_wg_config $TEMP_CONFIG; then
+            log "Aborting client deletion due to invalid resulting configuration."
+            rm -f $TEMP_CONFIG
+            return
+        fi
+
+        # Apply new config
+        mv $TEMP_CONFIG $WG_CONFIG
+        chmod 600 $WG_CONFIG
+
         # Extract client name for config file deletion
         CLIENT_NAME=$(grep -B1 "PublicKey = $DELETE_IDENTIFIER" $WG_CONFIG | grep "^# Client:" | awk -F ': ' '{print $2}' || echo "")
         if [[ -z $CLIENT_NAME ]]; then
             CLIENT_NAME=$(grep "# Client:.*$DELETE_IDENTIFIER" $WG_CONFIG | awk -F ': ' '{print $2}' || echo "")
         fi
-        # Remove peer from wg0.conf
-        sed -i "/# Client:.*$DELETE_IDENTIFIER\|PublicKey = $DELETE_IDENTIFIER/,+2d" $WG_CONFIG
         if ! grep "PublicKey = $DELETE_IDENTIFIER" $WG_CONFIG >/dev/null; then
             log "Successfully deleted client."
             # Delete client config file if it exists
