@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# WireGuardInstall (wginstall.sh)
-# Automates WireGuard VPN setup for hosting a gaming server behind NAT
-
 # Configuration variables
 WG_CONFIG="/etc/wireguard/wg0.conf"
 WG_KEY_DIR="/etc/wireguard"
@@ -14,16 +11,7 @@ VPN_SUBNET="10.8.0" # Default subnet
 VPS_IP=$(curl -s ifconfig.me) # Auto-detect public IP
 NET_IFACE=$(ip -o -f inet addr show | awk '/scope global/ {print $2}' | head -1) # Auto-detect network interface
 LOG_FILE="/var/log/wginstall.log"
-
-# Get user's home directory for wgclients folder
-if [[ -n $SUDO_USER ]]; then
-    USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    USER_NAME=$SUDO_USER
-else
-    USER_HOME=$HOME
-    USER_NAME=$(whoami)
-fi
-WG_CLIENTS_DIR="$USER_HOME/wgclients"
+WG_CLIENTS_DIR="$HOME/wgclients" # Folder for client configs
 
 # Ensure script runs as root
 if [[ $EUID -ne 0 ]]; then
@@ -47,8 +35,6 @@ generate_keys() {
     echo "$privkey" > "$privkey_file"
     echo "$pubkey" > "$pubkey_file"
     chmod 600 "$privkey_file" "$pubkey_file"
-    # Set ownership to user, not root
-    chown "$USER_NAME:$USER_NAME" "$privkey_file" "$pubkey_file"
     log "Private key saved to $privkey_file"
     log "Public key: $pubkey"
 }
@@ -88,19 +74,48 @@ setup_client() {
         log "Existing config found at $WG_CONFIG."
         read -p "Overwrite config? (y/n) [default: n]: " overwrite
         overwrite=${overwrite:-n}
-        [[ $overwrite =~ ^[Yy]$ ]] && rm -f "$WG_CONFIG"
+        if [[ $overwrite =~ ^[Nn]$ ]]; then
+            log "Keeping existing config. Exiting setup."
+            return
+        else
+            rm -f "$WG_CONFIG"
+        fi
     fi
 
-    generate_keys "$WG_PRIVATE_KEY" "$WG_PUBLIC_KEY"
-    CLIENT_PRIVKEY=$(cat "$WG_PRIVATE_KEY")
-    CLIENT_PUBKEY=$(cat "$WG_PUBLIC_KEY")
-    CLIENT_IP="$VPN_SUBNET.2"
+    # Prompt to import client config or manual setup
+    read -p "Import client config file? (y/n) [default: n]: " import_choice
+    import_choice=${import_choice:-n}
 
-    read -p "Enter VPS public key: " VPS_PUBKEY
-    read -p "Enter VPS public IP [default: $VPS_IP]: " INPUT_VPS_IP
-    VPS_IP=${INPUT_VPS_IP:-$VPS_IP}
+    if [[ $import_choice =~ ^[Yy]$ ]]; then
+        # Prompt for config filename with default in wgclients folder
+        read -p "Enter client config filename (default: client_gamingserver1.conf in $WG_CLIENTS_DIR): " CONFIG_FILENAME
+        CONFIG_FILENAME=${CONFIG_FILENAME:-client_gamingserver1.conf}
+        # Determine full path
+        if [[ ! $CONFIG_FILENAME =~ ^/ ]]; then
+            CONFIG_FILE="$WG_CLIENTS_DIR/$CONFIG_FILENAME"
+        else
+            CONFIG_FILE="$CONFIG_FILENAME"
+        fi
+        # Verify file exists and import
+        if [[ ! -f $CONFIG_FILE ]]; then
+            log "Error: Config file $CONFIG_FILE not found."
+            return
+        fi
+        cp "$CONFIG_FILE" "$WG_CONFIG"
+        chmod 600 "$WG_CONFIG"
+        log "Imported client config from $CONFIG_FILE to $WG_CONFIG"
+    else
+        # Manual setup
+        generate_keys "$WG_PRIVATE_KEY" "$WG_PUBLIC_KEY"
+        CLIENT_PRIVKEY=$(cat "$WG_PRIVATE_KEY")
+        CLIENT_PUBKEY=$(cat "$WG_PUBLIC_KEY")
+        CLIENT_IP="$VPN_SUBNET.2"
 
-    cat > "$WG_CONFIG" << EOL
+        read -p "Enter VPS public key: " VPS_PUBKEY
+        read -p "Enter VPS public IP [default: $VPS_IP]: " INPUT_VPS_IP
+        VPS_IP=${INPUT_VPS_IP:-$VPS_IP}
+
+        cat > "$WG_CONFIG" << EOL
 [Interface]
 PrivateKey = $CLIENT_PRIVKEY
 Address = $CLIENT_IP/24
@@ -111,11 +126,13 @@ Endpoint = $VPS_IP:$WG_PORT
 AllowedIPs = $VPN_SUBNET.0/24
 PersistentKeepalive = 25
 EOL
+        log "Manual client config created at $WG_CONFIG"
+    fi
 
+    # Start WireGuard
     systemctl enable wg-quick@$WG_INTERFACE
     systemctl restart wg-quick@$WG_INTERFACE
-    log "Client setup complete. Config saved to $WG_CONFIG"
-    log "Public key: $CLIENT_PUBKEY"
+    log "Client setup complete."
 }
 
 # Menu Option 2: Setup Server (VPS)
@@ -160,26 +177,6 @@ EOL
     log "Server setup complete. Public key: $SERVER_PUBKEY"
 }
 
-# Menu Option 3: Client Management
-client_management() {
-    while true; do
-        echo -e "\n=== Client Management Submenu ==="
-        echo "1. Add Client"
-        echo "2. View Clients"
-        echo "3. Delete Client"
-        echo "4. Back to Main Menu"
-        read -p "Select an option [1-4]: " sub_choice
-
-        case $sub_choice in
-            1) add_client ;;
-            2) view_clients ;;
-            3) delete_client ;;
-            4) break ;;
-            *) log "Invalid option." ;;
-        esac
-    done
-}
-
 # Suboption 3.1: Add Client
 add_client() {
     log "Adding new client..."
@@ -216,7 +213,6 @@ PersistentKeepalive = 25
 EOL
 
     chmod 600 "$CLIENT_CONF"
-    chown "$USER_NAME:$USER_NAME" "$CLIENT_CONF"
     systemctl restart wg-quick@$WG_INTERFACE
     log "Client '$CLIENT_NAME' added with IP $CLIENT_IP."
     log "Config saved to $CLIENT_CONF"
@@ -273,6 +269,26 @@ port_forwards_firewall() {
     ufw allow "$GAME_PORT/$PROTOCOL"
     ufw reload
     log "Port forwarding set for $GAME_PORT/$PROTOCOL to $CLIENT_IP"
+}
+
+# Client Management Submenu
+client_management() {
+    while true; do
+        echo -e "\n=== Client Management Submenu ==="
+        echo "1. Add Client"
+        echo "2. View Clients"
+        echo "3. Delete Client"
+        echo "4. Back to Main Menu"
+        read -p "Select an option [1-4]: " sub_choice
+
+        case $sub_choice in
+            1) add_client ;;
+            2) view_clients ;;
+            3) delete_client ;;
+            4) break ;;
+            *) log "Invalid option." ;;
+        esac
+    done
 }
 
 # Main Menu
