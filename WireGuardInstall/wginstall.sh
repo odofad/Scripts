@@ -280,6 +280,7 @@ detect_view_config() {
                         echo "WireGuardInstall: WireGuard restarted successfully."
                     else
                         echo "WireGuardInstall: Error: Failed to restart WireGuard."
+                        echo "WireGuardInstall: Check logs with 'systemctl status wg-quick@wg0.service' and 'journalctl -xeu wg-quick@wg0.service'"
                     fi
                 else
                     echo "WireGuardInstall: Error: Failed to delete client from $WG_CONFIG."
@@ -391,12 +392,23 @@ EOL
         echo "WireGuardInstall: Create client config manually with IP $CLIENT_IP and server details."
     fi
 
+    # Validate wg0.conf syntax
+    if ! wg-quick strip wg0 >/dev/null 2>&1; then
+        echo "WireGuardInstall: Error: Invalid configuration in $WG_CONFIG."
+        echo "WireGuardInstall: Please check $WG_CONFIG for syntax errors."
+        return
+    fi
+
     # Restart WireGuard
     systemctl restart wg-quick@$WG_INTERFACE
     if [[ $? -eq 0 ]]; then
         echo "WireGuardInstall: WireGuard restarted successfully."
     else
         echo "WireGuardInstall: Error: Failed to restart WireGuard."
+        echo "WireGuardInstall: Status:"
+        systemctl status wg-quick@$WG_INTERFACE --no-pager
+        echo "WireGuardInstall: Recent logs:"
+        journalctl -xeu wg-quick@$WG_INTERFACE --no-pager | tail -n 20
         return
     fi
 }
@@ -451,9 +463,17 @@ EOL
     # Start WireGuard
     systemctl enable wg-quick@$WG_INTERFACE
     systemctl restart wg-quick@$WG_INTERFACE
-    echo "WireGuardInstall: Server setup complete. Server IP: $SERVER_IP"
-    echo "WireGuardInstall: Public key: $SERVER_PUBKEY"
-    echo "WireGuardInstall: Config saved to $WG_CONFIG"
+    if [[ $? -eq 0 ]]; then
+        echo "WireGuardInstall: Server setup complete. Server IP: $SERVER_IP"
+        echo "WireGuardInstall: Public key: $SERVER_PUBKEY"
+        echo "WireGuardInstall: Config saved to $WG_CONFIG"
+    else
+        echo "WireGuardInstall: Error: Failed to start WireGuard."
+        echo "WireGuardInstall: Status:"
+        systemctl status wg-quick@$WG_INTERFACE --no-pager
+        echo "WireGuardInstall: Recent logs:"
+        journalctl -xeu wg-quick@$WG_INTERFACE --no-pager | tail -n 20
+    fi
 }
 
 # Menu Option 2: Server Submenu
