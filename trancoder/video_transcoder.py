@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import subprocess
 import json
@@ -57,17 +58,41 @@ stats = {"processed": 0, "failed": 0, "skipped": 0}
 
 def get_video_info(file_path):
     logging.info(f"Analyzing {file_path}...")
+    # Check file size (skip if < 1 KB)
+    if Path(file_path).stat().st_size < 1024:
+        logging.warning(f"Skipping: File {file_path} is too small ({Path(file_path).stat().st_size} bytes)")
+        stats["skipped"] += 1
+        return None, None, None, None
+    
+    # Probe video stream
+    cmd = [
+        "ffprobe", "-v", "error", "-show_streams", "-show_format",
+        "-select_streams", "v:0", "-print_format", "json", str(file_path)
+    ]
     try:
-        cmd = [
-            "ffprobe", "-v", "error", "-show_streams", "-show_format",
-            "-select_streams", "v:0", "-print_format", "json", str(file_path)
-        ]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         probe = json.loads(result.stdout)
         if not probe.get("streams"):
-            raise ValueError("No video stream found")
+            logging.warning(f"No video stream found in {file_path}, trying all streams")
+            # Fallback: Probe all streams
+            cmd = [
+                "ffprobe", "-v", "error", "-show_streams", "-show_format",
+                "-print_format", "json", str(file_path)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            probe = json.loads(result.stdout)
         
-        video_stream = probe["streams"][0]
+        video_stream = None
+        for stream in probe.get("streams", []):
+            if stream.get("codec_type") == "video":
+                video_stream = stream
+                break
+        
+        if not video_stream:
+            logging.error(f"No video stream found in {file_path}")
+            stats["skipped"] += 1
+            return None, None, None, None
+        
         width = int(video_stream["width"])
         height = int(video_stream["height"])
         
@@ -106,15 +131,23 @@ def get_video_info(file_path):
         
         logging.info(f"Detected: Resolution={resolution}, FPS={fps:.2f}, Duration={duration:.2f}s, Color={color_info}")
         return resolution, fps, color_info, duration
-    except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError, KeyError) as e:
-        logging.error(f"Could not probe {file_path}: {e}")
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Could not probe {file_path}: {e.stderr}")
+        stats["skipped"] += 1
+        return None, None, None, None
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        logging.error(f"Could not parse probe data for {file_path}: {e}")
         stats["skipped"] += 1
         return None, None, None, None
 
-def is_output_valid(output_path, input_duration):
-    """Check if the output file is valid and complete using ffprobe."""
+def is_output_valid(output_path, input_duration, resolution, fps):
     logging.info(f"Validating output file: {output_path}")
     try:
+        # Check file size (minimum 100 KB)
+        if output_path.stat().st_size < 100 * 1024:
+            logging.warning(f"File {output_path} is too small ({output_path.stat().st_size} bytes)")
+            return False
+        
         cmd = [
             "ffprobe", "-v", "error", "-show_streams", "-show_format",
             "-print_format", "json", str(output_path)
@@ -148,9 +181,9 @@ def is_output_valid(output_path, input_duration):
             logging.warning(f"Invalid audio codec {audio_stream.get('codec_name')} in {output_path}, expected aac")
             return False
         
-        # Check duration (allow 1% tolerance for encoding differences)
+        # Check duration (allow 0.5% tolerance)
         output_duration = float(probe.get("format", {}).get("duration", 0))
-        if input_duration > 0 and output_duration < input_duration * 0.99:
+        if input_duration > 0 and output_duration < input_duration * 0.995:
             logging.warning(f"Incomplete duration {output_duration:.2f}s vs input {input_duration:.2f}s in {output_path}")
             return False
         
@@ -161,6 +194,13 @@ def is_output_valid(output_path, input_duration):
         
         if not all(key in audio_stream for key in ["sample_rate", "channels"]):
             logging.warning(f"Missing essential audio stream metadata in {output_path}")
+            return False
+        
+        # Verify approximate bitrate
+        expected_bitrate = calculate_bitrate(resolution, fps)
+        format_bitrate = int(probe.get("format", {}).get("bit_rate", 0)) // 1000  # Convert to kbps
+        if format_bitrate < expected_bitrate * 0.5:
+            logging.warning(f"Bitrate {format_bitrate} kbps too low, expected ~{expected_bitrate} kbps in {output_path}")
             return False
         
         logging.info(f"Output file {output_path} is valid and complete")
@@ -191,7 +231,7 @@ def transcode_file(input_path):
     
     # Check if output exists and is valid
     if output_path.exists():
-        if is_output_valid(output_path, input_duration):
+        if is_output_valid(output_path, input_duration, resolution, fps):
             logging.info(f"Skipping: Output {output_path} is valid and complete")
             stats["skipped"] += 1
             return
@@ -215,11 +255,30 @@ def transcode_file(input_path):
     logging.info(f"Starting FFmpeg: {input_path} -> {output_path}")
     logging.info(f"Bitrate: {bitrate} kbps, Color={color_info}")
     try:
-        process = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, check=True)
+        # Run FFmpeg verbosely, streaming output
+        process = subprocess.Popen(
+            ffmpeg_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            universal_newlines=True
+        )
+        # Stream FFmpeg output in real-time
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            if line:
+                logging.info(f"FFmpeg: {line.strip()}")
+        
+        return_code = process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, ffmpeg_cmd, output="", stderr="See logged FFmpeg output")
+        
         logging.info(f"Finished: {output_path}")
         stats["processed"] += 1
     except subprocess.CalledProcessError as e:
-        logging.error(f"FFmpeg error: {e.stderr}")
+        logging.error(f"FFmpeg failed with exit code {e.returncode}")
         stats["failed"] += 1
         failed_dir = OUTPUT_DIR / "Failed"
         failed_dir.mkdir(exist_ok=True)
